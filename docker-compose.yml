@@ -1,0 +1,23 @@
+services:
+  score-repeat-api:
+    build: .
+    image: score-repeat-api:latest
+    container_name: score-repeat-api
+    ports:
+      - "8000:8000"
+    environment:
+      # 单请求允许的最大展开步数（服务端硬上限，默认 100000）
+      MAX_EXPANSION_STEPS: "100000"
+      # 请求未显式给 max_steps 时使用的默认值
+      DEFAULT_MAX_STEPS: "10000"
+      # 分页游标 HMAC 签名密钥；生产环境务必替换为足够长的随机串
+      CURSOR_SECRET: "dev-only-cursor-secret-change-me"
+      # 分页接口单页最大步数
+      MAX_PAGE_SIZE: "1000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
