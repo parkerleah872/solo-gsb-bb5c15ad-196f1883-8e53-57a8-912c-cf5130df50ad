@@ -119,6 +119,7 @@ class Issue(BaseModel):
     code: str
     message: str
     measure: Optional[int] = None
+    side: Optional[Literal["left", "right"]] = None
 
 
 class TimelineStep(BaseModel):
@@ -134,6 +135,57 @@ class TimelineStep(BaseModel):
 class TimelineResponse(BaseModel):
     steps: list[TimelineStep] = Field(..., description="按演奏顺序排列的时间轴步骤")
     total_duration_ms: int = Field(..., description="全曲总时长（毫秒，输出时四舍五入）")
+    warnings: list[Issue] = Field(default_factory=list)
+
+
+class PathDiffRequest(BaseModel):
+    """路径对比请求体：left / right 为两份带节拍速度的乐谱。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    left: list[TimelineMeasure] = Field(
+        ..., min_length=1, description="左侧乐谱（结构标记 + 每小节 beats / 可选 tempo_bpm）"
+    )
+    right: list[TimelineMeasure] = Field(
+        ..., min_length=1, description="右侧乐谱（结构标记 + 每小节 beats / 可选 tempo_bpm）"
+    )
+    max_steps: Optional[PositiveInt] = Field(
+        default=None,
+        description="单侧允许的最大展开步数（默认取服务端 DEFAULT_MAX_STEPS，硬上限 MAX_EXPANSION_STEPS）",
+    )
+
+
+class PathDiffOp(BaseModel):
+    """对齐结果中的一项：match 两侧一致，delete 左侧特有，insert 右侧特有。"""
+
+    op: Literal["match", "insert", "delete"] = Field(..., description="对齐操作类型")
+    left_measure: Optional[int] = Field(
+        default=None, description="左侧原始小节号（match / delete 时存在）"
+    )
+    left_occurrence: Optional[int] = Field(
+        default=None, description="左侧该小节第几次被演奏（match / delete 时存在）"
+    )
+    right_measure: Optional[int] = Field(
+        default=None, description="右侧原始小节号（match / insert 时存在）"
+    )
+    right_occurrence: Optional[int] = Field(
+        default=None, description="右侧该小节第几次被演奏（match / insert 时存在）"
+    )
+
+
+class PathDiffResponse(BaseModel):
+    ops: list[PathDiffOp] = Field(..., description="按对齐顺序排列的 match / insert / delete 项")
+    first_diff_index: Optional[int] = Field(
+        ..., description="ops 中首个非 match 项的位置（从 1 开始）；两条路径完全一致时为 null"
+    )
+    total_differences: int = Field(
+        ..., description="差异总数（insert + delete 项数，即最小编辑代价）"
+    )
+    left_total_duration_ms: int = Field(..., description="左侧全曲总时长（毫秒，四舍五入）")
+    right_total_duration_ms: int = Field(..., description="右侧全曲总时长（毫秒，四舍五入）")
+    duration_diff_ms: int = Field(
+        ..., description="两侧总时长差（左 - 右，毫秒，带符号）"
+    )
     warnings: list[Issue] = Field(default_factory=list)
 
 

@@ -884,3 +884,304 @@ def test_timeline_warnings_carried():
         ),
     ).json()
     assert any(w["code"] == "UNREACHABLE_MEASURES" for w in body["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# 路径对比 /api/v1/path-diff
+# ---------------------------------------------------------------------------
+
+
+def tmeasures(flags: list[dict], tempo=120) -> list[dict]:
+    """构造单侧乐谱：每小节默认 4 拍、首小节默认给定 BPM。"""
+    measures = []
+    for i, f in enumerate(flags):
+        m = {"measure": i + 1, "beats": 4}
+        if i == 0:
+            m["tempo_bpm"] = tempo
+        m.update(f)
+        measures.append(m)
+    return measures
+
+
+def dreq(
+    left_flags: list[dict],
+    right_flags: list[dict],
+    left_tempo=120,
+    right_tempo=120,
+    **extra,
+) -> dict:
+    """构造路径对比请求。"""
+    return {
+        "left": tmeasures(left_flags, left_tempo),
+        "right": tmeasures(right_flags, right_tempo),
+        **extra,
+    }
+
+
+def test_path_diff_identical_scores():
+    r = client.post("/api/v1/path-diff", json=dreq([ms(), ms()], [ms(), ms()]))
+    assert r.status_code == 200
+    body = r.json()
+    assert [o["op"] for o in body["ops"]] == ["match", "match"]
+    assert body["ops"][0] == {
+        "op": "match",
+        "left_measure": 1,
+        "left_occurrence": 1,
+        "right_measure": 1,
+        "right_occurrence": 1,
+    }
+    assert body["first_diff_index"] is None
+    assert body["total_differences"] == 0
+    assert body["left_total_duration_ms"] == body["right_total_duration_ms"] == 4000
+    assert body["duration_diff_ms"] == 0
+
+
+def test_path_diff_left_extra_repeat_yields_deletes_with_occurrence():
+    # 左侧反复 3 遍、右侧 2 遍：第三遍的每一步都是 delete，occurrence 为 3
+    body = client.post(
+        "/api/v1/path-diff",
+        json=dreq(
+            [ms(repeat_start=True, repeat_times=3), ms(repeat_end=True)],
+            [ms(repeat_start=True), ms(repeat_end=True)],
+        ),
+    ).json()
+    assert [(o["op"], o["left_measure"], o["left_occurrence"]) for o in body["ops"]] == [
+        ("match", 1, 1),
+        ("match", 2, 1),
+        ("match", 1, 2),
+        ("match", 2, 2),
+        ("delete", 1, 3),
+        ("delete", 2, 3),
+    ]
+    assert body["first_diff_index"] == 5
+    assert body["total_differences"] == 2
+    assert body["duration_diff_ms"] == 4000  # 左侧多奏一遍（2 小节 × 2000ms）
+
+
+def test_path_diff_right_extra_measures_yields_inserts():
+    body = client.post(
+        "/api/v1/path-diff",
+        json=dreq([ms(), ms()], [ms(), ms(), ms(), ms(beats=2)]),
+    ).json()
+    ops = body["ops"]
+    assert [o["op"] for o in ops] == ["match", "match", "insert", "insert"]
+    assert ops[2]["right_measure"] == 3 and ops[2]["right_occurrence"] == 1
+    assert ops[2]["left_measure"] is None and ops[2]["left_occurrence"] is None
+    assert ops[3]["right_measure"] == 4
+    assert body["first_diff_index"] == 3
+    assert body["total_differences"] == 2
+    # 右侧多 4 拍 + 2 拍 @120 = 3000ms
+    assert body["duration_diff_ms"] == -3000
+
+
+def test_path_diff_tempo_difference_reflected_in_duration_diff():
+    # 路径完全相同，仅速度不同：无差异项，但总时长差非零
+    body = client.post(
+        "/api/v1/path-diff",
+        json=dreq([ms(), ms()], [ms(), ms()], left_tempo=120, right_tempo=60),
+    ).json()
+    assert body["total_differences"] == 0
+    assert body["first_diff_index"] is None
+    assert body["left_total_duration_ms"] == 4000
+    assert body["right_total_duration_ms"] == 8000
+    assert body["duration_diff_ms"] == -4000
+
+
+def test_path_diff_matched_occurrences_pair_in_order():
+    # 左路径 1,2,1,3（第一/第二结尾），右路径 1,2：
+    # 右侧第 1 遍与左侧第 1 遍配对，左侧第二遍的 1 与第二结尾 3 为 delete
+    body = client.post(
+        "/api/v1/path-diff",
+        json=dreq(
+            [
+                ms(repeat_start=True),
+                ms(ending_start=True, ending_number=1, ending_stop=True,
+                   repeat_end=True),
+                ms(ending_start=True, ending_number=2, ending_stop=True),
+            ],
+            [ms(), ms()],
+        ),
+    ).json()
+    assert [
+        (o["op"], o["left_measure"], o["left_occurrence"], o["right_occurrence"])
+        for o in body["ops"]
+    ] == [
+        ("match", 1, 1, 1),
+        ("match", 2, 1, 1),
+        ("delete", 1, 2, None),
+        ("delete", 3, 1, None),
+    ]
+    assert body["first_diff_index"] == 3
+    assert body["total_differences"] == 2
+
+
+def test_path_diff_uses_expansion_semantics_on_both_sides():
+    # 左侧 D.C. al Fine、右侧带第一/第二结尾，验证按演奏语义展开后再对齐
+    left = tmeasures(
+        [
+            ms(),                          # 1
+            ms(fine=True),                 # 2 Fine
+            ms(),                          # 3
+            ms(navigation="dc_al_fine"),   # 4 D.C. al Fine
+        ]
+    )
+    right = tmeasures(
+        [
+            ms(repeat_start=True),                              # 1 |:
+            ms(ending_start=True, ending_number=1, ending_stop=True,
+               repeat_end=True),                                # 2 1. :|
+            ms(ending_start=True, ending_number=2, ending_stop=True),  # 3 2.
+        ]
+    )
+    body = client.post("/api/v1/path-diff", json={"left": left, "right": right}).json()
+    # 左路径 1,2,3,4,1,2；右路径 1,2,1,3
+    assert [(o["op"], o["left_measure"], o["right_measure"]) for o in body["ops"]] == [
+        ("match", 1, 1),
+        ("match", 2, 2),
+        ("delete", 3, None),
+        ("delete", 4, None),
+        ("match", 1, 1),
+        ("delete", 2, None),
+        ("insert", None, 3),
+    ]
+    assert body["total_differences"] == 4
+    assert body["first_diff_index"] == 3
+
+
+def test_path_diff_left_field_error_has_side_and_measure():
+    r = client.post(
+        "/api/v1/path-diff",
+        json=dreq([ms(), ms(beats=0)], [ms(), ms()]),
+    )
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail[0]["code"] == "INVALID_BEATS"
+    assert detail[0]["measure"] == 2
+    assert detail[0]["side"] == "left"
+    assert "ops" not in r.json()
+
+
+def test_path_diff_right_tempo_missing():
+    r = client.post(
+        "/api/v1/path-diff",
+        json={
+            "left": [{"measure": 1, "beats": 4, "tempo_bpm": 120}],
+            "right": [{"measure": 1, "beats": 4}],
+        },
+    )
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail[0]["code"] == "TEMPO_MISSING"
+    assert detail[0]["side"] == "right"
+
+
+def test_path_diff_both_sides_invalid_reported_together():
+    r = client.post(
+        "/api/v1/path-diff",
+        json={
+            "left": [{"measure": 1, "beats": -1, "tempo_bpm": 120}],
+            "right": [{"measure": 1, "beats": 4, "tempo_bpm": 120, "repeat_start": True}],
+        },
+    )
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert {(d["side"], d["code"]) for d in detail} == {
+        ("left", "INVALID_BEATS"),
+        ("right", "UNCLOSED_REPEAT"),
+    }
+    assert all("measure" in d for d in detail)
+    assert "ops" not in r.json()
+
+
+def test_path_diff_structural_error_has_measure_and_no_partial_result():
+    r = client.post(
+        "/api/v1/path-diff",
+        json=dreq([ms(repeat_start=True), ms()], [ms(), ms()]),
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["detail"][0]["code"] == "UNCLOSED_REPEAT"
+    assert body["detail"][0]["measure"] == 1
+    assert body["detail"][0]["side"] == "left"
+    assert "ops" not in body
+    assert "total_differences" not in body
+
+
+def test_path_diff_measure_numbers_must_increase():
+    r = client.post(
+        "/api/v1/path-diff",
+        json={
+            "left": [{"measure": 1, "beats": 4, "tempo_bpm": 120}],
+            "right": [
+                {"measure": 2, "beats": 4, "tempo_bpm": 120},
+                {"measure": 2, "beats": 4},
+            ],
+        },
+    )
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail[0]["code"] == "MEASURE_NOT_INCREASING"
+    assert detail[0]["side"] == "right"
+
+
+def test_path_diff_max_steps_exceeded_has_side_and_measure():
+    r = client.post(
+        "/api/v1/path-diff",
+        json=dreq(
+            [ms(repeat_start=True, repeat_times=99), ms(repeat_end=True)],
+            [ms()],
+            max_steps=10,
+        ),
+    )
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail[0]["code"] == "MAX_STEPS_EXCEEDED"
+    assert detail[0]["side"] == "left"
+    assert "measure" in detail[0]
+    assert "ops" not in r.json()
+
+
+def test_path_diff_max_steps_too_large():
+    r = client.post("/api/v1/path-diff", json=dreq([ms()], [ms()], max_steps=10_000_000))
+    assert r.status_code == 422
+    assert r.json()["detail"][0]["code"] == "MAX_STEPS_TOO_LARGE"
+
+
+def test_path_diff_alignment_size_limit(monkeypatch):
+    from app import main
+
+    monkeypatch.setattr(main.settings, "max_diff_cells", 4)
+    # 两侧无公共前后缀，中段 3x3 = 9 > 4
+    r = client.post(
+        "/api/v1/path-diff",
+        json={
+            "left": [
+                {"measure": 1, "beats": 4, "tempo_bpm": 120},
+                {"measure": 2, "beats": 4},
+                {"measure": 3, "beats": 4},
+            ],
+            "right": [
+                {"measure": 4, "beats": 4, "tempo_bpm": 120},
+                {"measure": 5, "beats": 4},
+                {"measure": 6, "beats": 4},
+            ],
+        },
+    )
+    assert r.status_code == 422
+    assert r.json()["detail"][0]["code"] == "DIFF_TOO_LARGE"
+    assert "ops" not in r.json()
+
+
+def test_path_diff_warnings_carry_side():
+    body = client.post(
+        "/api/v1/path-diff",
+        json=dreq(
+            [ms(), ms(to_coda=True), ms(navigation="dc_al_coda"), ms(), ms(coda=True)],
+            [ms()],
+        ),
+    ).json()
+    assert any(
+        w["code"] == "UNREACHABLE_MEASURES" and w["side"] == "left"
+        for w in body["warnings"]
+    )
+    assert all(w["side"] in ("left", "right") for w in body["warnings"])

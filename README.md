@@ -9,16 +9,19 @@
 - 第一/第二（及第三……）结尾（volta 房子），结尾数须与反复遍数一致；
 - `D.C.` / `D.S.` `al Fine` 与 `al Coda`（含 Segno / Fine / To Coda / Coda）。
 
-展开方式：
+展开与对比：
 
 - `POST /api/v1/expand` —— 一次性展开整曲；
 - `POST /api/v1/expand-page` —— 无状态分页展开：首页携带 `page_size`，
   后续凭签名游标 `next_cursor` 续页，拼接结果与一次性展开**逐步一致**；
 - `POST /api/v1/timeline` —— 在展开语义之上，按每小节的 `beats` 与
-  `tempo_bpm` 把实际演奏路径换算为**毫秒时间轴**。
+  `tempo_bpm` 把实际演奏路径换算为**毫秒时间轴**；
+- `POST /api/v1/path-diff` —— 对比两份乐谱：各自展开后按**最小编辑代价**
+  对齐两条实际演奏路径，返回逐项 `match` / `insert` / `delete`、
+  首个差异位置、差异总数与两侧总时长差。
 
 遇到**未闭合反复、非法跳转、非法节拍/速度、超过最大展开步数**等问题时，
-返回带**小节定位**的 422 错误，且**不产出任何部分序列/时间轴**。
+返回带**小节定位**的 422 错误，且**不产出任何部分序列/时间轴/对比结果**。
 
 ## 一条命令启动
 
@@ -76,6 +79,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `DEFAULT_MAX_STEPS` | `10000` | 请求未指定 `max_steps` 时使用的默认值（不得大于硬上限） |
 | `CURSOR_SECRET` | `insecure-dev-cursor-secret-change-me` | 分页游标 HMAC 签名密钥；**生产环境必须替换**为足够长的随机串，否则游标可被伪造 |
 | `MAX_PAGE_SIZE` | `1000` | 分页接口单页最大步数；`page_size` 超过此值直接 422 |
+| `MAX_DIFF_CELLS` | `4000000` | 路径对比接口的对齐规模上限（剥离公共前后缀后：左长度 × 右长度）；超过直接 422 |
 | 端口 | `8000` | 容器固定监听 8000；如需改宿主机端口，修改 compose 的端口映射，如 `"9000:8000"` |
 
 ## 接口
@@ -273,6 +277,82 @@ curl -s http://localhost:8000/api/v1/timeline \
 都返回与 `/expand` 相同格式的 422（`detail` 带 `code` 与 `measure`），
 且**不产出任何部分时间轴**。新增错误码见下表。
 
+### `POST /api/v1/path-diff` — 演奏路径对比
+
+提交 `left` / `right` 两份带 `beats` / `tempo_bpm` 的乐谱（字段约定同
+`/timeline`）与可选的 `max_steps`（对两侧同时生效），两侧分别按与
+`/timeline` 完全相同的语义校验并展开，再以**最小编辑代价**对齐两条实际
+演奏路径：
+
+- 对齐键为**原始小节号**；`match` 代价 0，`insert` / `delete` 代价 1；
+- 同一小节被反复演奏多次时，匹配按演奏顺序稳定成对（第 k 次对第 k 次）；
+- **平局裁决**：先剥离两条路径的公共前缀/后缀（直接记为 `match`），
+  其余位置相同代价时按 `match → delete → insert` 稳定择优，
+  对齐结果确定、可复现。
+
+```bash
+curl -s http://localhost:8000/api/v1/path-diff \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "left": [
+      {"measure": 1, "beats": 4, "tempo_bpm": 120, "repeat_start": true, "repeat_times": 3},
+      {"measure": 2, "beats": 4, "repeat_end": true}
+    ],
+    "right": [
+      {"measure": 1, "beats": 4, "tempo_bpm": 120, "repeat_start": true},
+      {"measure": 2, "beats": 4, "repeat_end": true}
+    ]
+  }'
+```
+
+左侧反复 3 遍、右侧 2 遍，对齐结果中第三遍为 `delete`：
+
+```json
+{
+  "ops": [
+    {"op": "match", "left_measure": 1, "left_occurrence": 1, "right_measure": 1, "right_occurrence": 1},
+    {"op": "match", "left_measure": 2, "left_occurrence": 1, "right_measure": 2, "right_occurrence": 1},
+    {"op": "match", "left_measure": 1, "left_occurrence": 2, "right_measure": 1, "right_occurrence": 2},
+    {"op": "match", "left_measure": 2, "left_occurrence": 2, "right_measure": 2, "right_occurrence": 2},
+    {"op": "delete", "left_measure": 1, "left_occurrence": 3, "right_measure": null, "right_occurrence": null},
+    {"op": "delete", "left_measure": 2, "left_occurrence": 3, "right_measure": null, "right_occurrence": null}
+  ],
+  "first_diff_index": 5,
+  "total_differences": 2,
+  "left_total_duration_ms": 12000,
+  "right_total_duration_ms": 8000,
+  "duration_diff_ms": 4000,
+  "warnings": []
+}
+```
+
+响应字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `ops` | 按对齐顺序的逐项结果；`op` 为 `match`（两侧一致）/ `delete`（左侧特有）/ `insert`（右侧特有），每项携带相关侧的 `measure` 与 `occurrence`（不适用的侧为 `null`） |
+| `first_diff_index` | `ops` 中首个非 `match` 项的位置（从 1 开始）；两条路径完全一致时为 `null` |
+| `total_differences` | 差异总数（`insert` + `delete` 项数，即最小编辑代价） |
+| `left_total_duration_ms` / `right_total_duration_ms` | 两侧全曲总时长（毫秒，与 `/timeline` 相同的精确累计 + 输出取整） |
+| `duration_diff_ms` | 两侧总时长差（**左 - 右**，带符号） |
+| `warnings` | 两侧结构警告，每条带 `side`（`left` / `right`）标明来源 |
+
+任一侧的**结构、节拍速度或展开上限**无效时，返回 422 且**不产出任何
+部分对比结果**；`detail` 中每条错误都带 `code`、`measure`（小节定位）
+与 `side`（标明出错的一侧），两侧的错误会一次性合并返回：
+
+```json
+{
+  "detail": [
+    {"code": "INVALID_BEATS", "message": "beats 必须为正数：第 2 小节的 beats=0.0", "measure": 2, "side": "left"},
+    {"code": "UNCLOSED_REPEAT", "message": "存在未闭合的左反复记号 |:（缺少配对的 :|）", "measure": 1, "side": "right"}
+  ]
+}
+```
+
+对齐规模（剥离公共前后缀后：左长度 × 右长度）超过服务端上限
+`MAX_DIFF_CELLS` 时返回 422 `DIFF_TOO_LARGE`，同样不产出部分结果。
+
 ### `POST /api/v1/validate` — 结构校验
 
 请求体与展开接口相同。无论是否合法都返回 **200**，由 `valid` 字段标识，
@@ -323,8 +403,9 @@ curl -s http://localhost:8000/api/v1/validate \
 | `MULTIPLE_NAVIGATION` / `AMBIGUOUS_*` | 多个指令或多个同名目标点 |
 | `MAX_STEPS_EXCEEDED` | 展开步数超过请求的 `max_steps`（错误带当前小节定位） |
 | `MAX_STEPS_TOO_LARGE` | 请求的 `max_steps` 超过服务端硬上限 |
-| `BEATS_MISSING` / `INVALID_BEATS` | 小节缺少 `beats` / `beats` 非正数或非有限值（仅时间轴接口） |
-| `TEMPO_MISSING` / `INVALID_TEMPO` | 首小节缺少 `tempo_bpm` / 速度标记非正数或非有限值（仅时间轴接口） |
+| `BEATS_MISSING` / `INVALID_BEATS` | 小节缺少 `beats` / `beats` 非正数或非有限值（时间轴与路径对比接口） |
+| `TEMPO_MISSING` / `INVALID_TEMPO` | 首小节缺少 `tempo_bpm` / 速度标记非正数或非有限值（时间轴与路径对比接口） |
+| `DIFF_TOO_LARGE` | 路径对比的对齐规模超过 `MAX_DIFF_CELLS`（仅路径对比接口） |
 | `CURSOR_INVALID` / `CURSOR_SCORE_MISMATCH` / `CURSOR_PARAM_MISMATCH` | 分页游标被篡改 / 换谱 / 分页参数不一致 |
 | `PAGE_SIZE_REQUIRED` / `PAGE_SIZE_TOO_LARGE` | 首页缺 `page_size` / 超过 `MAX_PAGE_SIZE` |
 
@@ -339,16 +420,18 @@ pytest -q
 
 ```
 app/
-  main.py       # FastAPI 路由：/api/v1/expand、/api/v1/expand-page、/api/v1/timeline、/api/v1/validate、/health
+  main.py       # FastAPI 路由：/api/v1/expand、/api/v1/expand-page、/api/v1/timeline、/api/v1/path-diff、/api/v1/validate、/health
   analyzer.py   # 静态结构分析：反复段 / 结尾 / 导航标记解析与校验
   expander.py   # 演奏语义虚拟机：生成实际小节序列（VMState 支持断点续页）
   timeline.py   # 时间轴换算：beats/tempo -> 毫秒（Fraction 精确累计，输出才取整）
+  diff.py       # 路径对齐：最小编辑代价（match/insert/delete），平局按路径顺序稳定择优
   pagination.py # 分页游标：HMAC 签名、乐谱指纹与分页参数绑定
   models.py     # Pydantic 请求/响应模型
   config.py     # 环境变量配置
   errors.py     # 带小节定位的错误类型
 tests/
   test_api.py
+  test_diff.py
 Dockerfile
 docker-compose.yml
 ```
