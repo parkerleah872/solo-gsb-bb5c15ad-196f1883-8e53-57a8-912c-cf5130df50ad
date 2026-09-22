@@ -14,6 +14,8 @@ services:
       CURSOR_SECRET: "dev-only-cursor-secret-change-me"
       # 分页接口单页最大步数
       MAX_PAGE_SIZE: "1000"
+      # 路径对比两侧展开路径长度乘积上限（对齐复杂度 O(n·m)）
+      MAX_DIFF_CELLS: "4000000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
       interval: 10s

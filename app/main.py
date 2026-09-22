@@ -1,12 +1,15 @@
-"""FastAPI 入口：展开、分页展开、结构校验与时间轴接口。"""
+"""FastAPI 入口：展开、分页展开、结构校验、时间轴与路径对比接口。"""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .analyzer import Analysis, analyze
 from .config import get_settings
+from .diff import align_paths
 from .errors import StructuralError
 from .expander import ExpansionError, VMState, expand, run
 from .models import (
@@ -15,9 +18,15 @@ from .models import (
     ExpandRequest,
     ExpandResponse,
     Issue,
+    PathDiffItem,
+    PathDiffRequest,
+    PathDiffResponse,
+    PathDiffSideRef,
     Step,
+    TimelineMeasure,
     TimelineRequest,
     TimelineResponse,
+    TimelineStep,
     ValidateResponse,
 )
 from .pagination import (
@@ -36,8 +45,9 @@ app = FastAPI(
     description=(
         "提交按小节排列的结构标记（成对反复、第一/第二结尾、"
         "D.C./D.S. al Coda/Fine），返回按演奏语义展开的实际小节序列。"
-        "支持一次性展开、无状态分页展开（签名游标续页），"
-        "以及按 beats/tempo 把演奏路径换算为毫秒时间轴。"
+        "支持一次性展开、无状态分页展开（签名游标续页）、"
+        "按 beats/tempo 把演奏路径换算为毫秒时间轴，"
+        "以及对比两份乐谱的实际演奏路径（path-diff）。"
     ),
 )
 
@@ -61,30 +71,36 @@ def _error_response(errors: list[StructuralError]) -> JSONResponse:
     )
 
 
-def _check_expandable(measures, max_steps: int):
+def _expand_precheck(measures, max_steps: int):
     """展开前检查：小节号递增、max_steps 上限、结构合法性。
 
-    通过时返回 Analysis；否则返回 422 JSONResponse（不产出任何部分序列）。
+    通过时返回 Analysis；否则返回 StructuralError 列表（不产出任何部分序列）。
     """
     number_errors = _check_measure_numbers(measures)
     if number_errors:
-        return _error_response(number_errors)
+        return number_errors
 
     if max_steps > settings.max_expansion_steps:
-        return _error_response(
-            [
-                StructuralError(
-                    "MAX_STEPS_TOO_LARGE",
-                    f"请求的 max_steps={max_steps} 超过服务端上限 "
-                    f"{settings.max_expansion_steps}（MAX_EXPANSION_STEPS）",
-                )
-            ]
-        )
+        return [
+            StructuralError(
+                "MAX_STEPS_TOO_LARGE",
+                f"请求的 max_steps={max_steps} 超过服务端上限 "
+                f"{settings.max_expansion_steps}（MAX_EXPANSION_STEPS）",
+            )
+        ]
 
     analysis = analyze(measures)
     if analysis.errors:
-        return _error_response(analysis.errors)
+        return analysis.errors
     return analysis
+
+
+def _check_expandable(measures, max_steps: int):
+    """展开前检查的 422 包装：通过时返回 Analysis，否则返回 JSONResponse。"""
+    checked = _expand_precheck(measures, max_steps)
+    if isinstance(checked, list):
+        return _error_response(checked)
+    return checked
 
 
 def _check_measure_numbers(measures) -> list[StructuralError]:
@@ -197,6 +213,140 @@ def do_timeline(req: TimelineRequest):
         steps=steps,
         total_duration_ms=total_ms,
         warnings=[_issue(w).model_dump(exclude_none=True) for w in analysis.warnings],  # type: ignore[list-item]
+    )
+
+
+# ---------------------------------------------------------------------------
+# 路径对比 /api/v1/path-diff
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _DiffSide:
+    """path-diff 单侧的处理结果：全部校验通过时携带时间轴，否则携带错误。"""
+
+    errors: list[StructuralError]
+    warnings: list[StructuralError]
+    steps: list[TimelineStep]
+    total_ms: int
+
+
+def _prepare_diff_side(measures: list[TimelineMeasure], max_steps: int) -> _DiffSide:
+    """校验并展开 path-diff 的单侧乐谱。
+
+    校验顺序与展开、计时语义和 ``/timeline`` 完全一致；任何错误都完整
+    收集后返回，由调用方统一转成 422（不产出任何部分对比结果）。
+    """
+    empty = _DiffSide(errors=[], warnings=[], steps=[], total_ms=0)
+
+    field_errors = check_timeline_fields(measures)
+    if field_errors:
+        empty.errors = field_errors
+        return empty
+
+    checked = _expand_precheck(measures, max_steps)
+    if isinstance(checked, list):
+        empty.errors = checked
+        return empty
+    analysis: Analysis = checked
+
+    try:
+        played = expand(analysis, max_steps=max_steps)
+    except ExpansionError as exc:
+        empty.errors = [StructuralError(exc.code, exc.message, exc.measure)]
+        return empty
+
+    steps, total_ms = build_timeline(measures, played)
+    return _DiffSide(
+        errors=[], warnings=analysis.warnings, steps=steps, total_ms=total_ms
+    )
+
+
+def _side_issue(side: str, err: StructuralError) -> dict:
+    """带 side（left/right）标记的错误/警告条目。"""
+    return Issue(
+        code=err.code, message=err.message, measure=err.measure, side=side  # type: ignore[arg-type]
+    ).model_dump(exclude_none=True)
+
+
+def _side_error_response(left_errors, right_errors) -> JSONResponse:
+    """path-diff 的 422：每条错误带 side 与小节定位，不产出任何部分结果。"""
+    detail = [_side_issue("left", e) for e in left_errors] + [
+        _side_issue("right", e) for e in right_errors
+    ]
+    return JSONResponse(status_code=422, content={"detail": detail})
+
+
+@app.post("/api/v1/path-diff", response_model=PathDiffResponse)
+def do_path_diff(req: PathDiffRequest):
+    """对比两份乐谱的实际演奏路径。
+
+    left/right 分别按与 ``/timeline`` 相同的结构校验、展开与计时语义处理，
+    再用最小编辑代价（insert + delete，即 LCS 距离）对齐两条实际演奏路径；
+    相同代价时按路径顺序稳定择优（先 match、再 delete、后 insert）。
+    任一侧的结构、节拍速度或展开上限非法时，返回带 side 与小节定位的 422，
+    不产出任何部分对比结果。
+    """
+    max_steps = req.max_steps or settings.default_max_steps
+
+    left = _prepare_diff_side(req.left.measures, max_steps)
+    right = _prepare_diff_side(req.right.measures, max_steps)
+    if left.errors or right.errors:
+        return _side_error_response(left.errors, right.errors)  # type: ignore[return-value]
+
+    cells = len(left.steps) * len(right.steps)
+    if cells > settings.max_diff_cells:
+        return _error_response(  # type: ignore[return-value]
+            [
+                StructuralError(
+                    "DIFF_TOO_LARGE",
+                    f"两侧展开路径长度乘积 {len(left.steps)}×{len(right.steps)}={cells} "
+                    f"超过服务端上限 {settings.max_diff_cells}（MAX_DIFF_CELLS）",
+                )
+            ]
+        )
+
+    ops = align_paths(
+        [s.measure for s in left.steps], [s.measure for s in right.steps]
+    )
+
+    def _ref(side_steps: list[TimelineStep], index: int | None) -> PathDiffSideRef | None:
+        if index is None:
+            return None
+        s = side_steps[index]
+        return PathDiffSideRef(index=index + 1, measure=s.measure, occurrence=s.occurrence)
+
+    items: list[PathDiffItem] = []
+    matches = 0
+    diff_count = 0
+    first_diff_index: int | None = None
+    for op in ops:
+        if op.kind == "match":
+            matches += 1
+        else:
+            diff_count += 1
+            if first_diff_index is None:
+                first_diff_index = len(items) + 1
+        items.append(
+            PathDiffItem(
+                type=op.kind,
+                left=_ref(left.steps, op.left_index),
+                right=_ref(right.steps, op.right_index),
+            )
+        )
+
+    return PathDiffResponse(
+        items=items,
+        left_steps=len(left.steps),
+        right_steps=len(right.steps),
+        matches=matches,
+        diff_count=diff_count,
+        first_diff_index=first_diff_index,
+        left_total_duration_ms=left.total_ms,
+        right_total_duration_ms=right.total_ms,
+        total_duration_diff_ms=right.total_ms - left.total_ms,
+        warnings=[_side_issue("left", w) for w in left.warnings]  # type: ignore[list-item]
+        + [_side_issue("right", w) for w in right.warnings],
     )
 
 

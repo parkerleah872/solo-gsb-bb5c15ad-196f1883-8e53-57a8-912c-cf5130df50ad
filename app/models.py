@@ -119,6 +119,9 @@ class Issue(BaseModel):
     code: str
     message: str
     measure: Optional[int] = None
+    side: Optional[Literal["left", "right"]] = Field(
+        default=None, description="仅路径对比接口使用：标记问题属于哪一侧乐谱"
+    )
 
 
 class TimelineStep(BaseModel):
@@ -134,6 +137,66 @@ class TimelineStep(BaseModel):
 class TimelineResponse(BaseModel):
     steps: list[TimelineStep] = Field(..., description="按演奏顺序排列的时间轴步骤")
     total_duration_ms: int = Field(..., description="全曲总时长（毫秒，输出时四舍五入）")
+    warnings: list[Issue] = Field(default_factory=list)
+
+
+class PathDiffSide(BaseModel):
+    """路径对比接口的单侧乐谱（与 /timeline 相同的小节格式）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    measures: list[TimelineMeasure] = Field(
+        ..., min_length=1, description="按小节排列的结构标记 + 每小节 beats / 可选 tempo_bpm"
+    )
+
+
+class PathDiffRequest(BaseModel):
+    """路径对比请求体：left/right 两份乐谱分别展开后按最小编辑代价对齐。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    left: PathDiffSide = Field(..., description="左侧（基准）乐谱")
+    right: PathDiffSide = Field(..., description="右侧（对比）乐谱")
+    max_steps: Optional[PositiveInt] = Field(
+        default=None,
+        description="单侧允许的最大展开步数（默认取服务端 DEFAULT_MAX_STEPS，硬上限 MAX_EXPANSION_STEPS）",
+    )
+
+
+class PathDiffSideRef(BaseModel):
+    """对齐项中某一侧的一次演奏。"""
+
+    index: int = Field(..., description="该侧展开路径中从 1 开始的演奏序号")
+    measure: int = Field(..., description="原始小节号")
+    occurrence: int = Field(..., description="该小节在该侧第几次被演奏（从 1 开始）")
+
+
+class PathDiffItem(BaseModel):
+    """一个对齐项：match（两侧一致）/ delete（仅左侧）/ insert（仅右侧）。"""
+
+    type: Literal["match", "insert", "delete"] = Field(..., description="对齐操作类型")
+    left: Optional[PathDiffSideRef] = Field(
+        default=None, description="左侧演奏步骤（insert 时为 null）"
+    )
+    right: Optional[PathDiffSideRef] = Field(
+        default=None, description="右侧演奏步骤（delete 时为 null）"
+    )
+
+
+class PathDiffResponse(BaseModel):
+    items: list[PathDiffItem] = Field(..., description="按路径顺序排列的对齐项")
+    left_steps: int = Field(..., description="左侧展开后的总步数")
+    right_steps: int = Field(..., description="右侧展开后的总步数")
+    matches: int = Field(..., description="match 项数量")
+    diff_count: int = Field(..., description="差异总数（insert + delete，即最小编辑代价）")
+    first_diff_index: Optional[int] = Field(
+        default=None, description="首个差异在 items 中的位置（从 1 开始）；完全一致时为 null"
+    )
+    left_total_duration_ms: int = Field(..., description="左侧全曲总时长（毫秒）")
+    right_total_duration_ms: int = Field(..., description="右侧全曲总时长（毫秒）")
+    total_duration_diff_ms: int = Field(
+        ..., description="两侧总时长差（右侧 − 左侧，毫秒，带符号）"
+    )
     warnings: list[Issue] = Field(default_factory=list)
 
 

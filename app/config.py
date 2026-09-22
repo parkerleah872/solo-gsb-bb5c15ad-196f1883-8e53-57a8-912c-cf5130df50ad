@@ -16,6 +16,8 @@ class Settings:
             "CURSOR_SECRET", "insecure-dev-cursor-secret-change-me"
         )
         self.max_page_size: int = int(os.getenv("MAX_PAGE_SIZE", "1000"))
+        # 路径对比两侧展开路径长度乘积的上限（对齐算法时间/空间均为 O(n·m)）
+        self.max_diff_cells: int = int(os.getenv("MAX_DIFF_CELLS", "4000000"))
 
         if self.max_expansion_steps < 1:
             raise ValueError("MAX_EXPANSION_STEPS 必须为正整数")
@@ -25,6 +27,8 @@ class Settings:
             raise ValueError("CURSOR_SECRET 不能为空")
         if self.max_page_size < 1:
             raise ValueError("MAX_PAGE_SIZE 必须为正整数")
+        if self.max_diff_cells < 1:
+            raise ValueError("MAX_DIFF_CELLS 必须为正整数")
 
 
 @lru_cache(maxsize=1)
